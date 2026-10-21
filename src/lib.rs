@@ -371,6 +371,8 @@ pub enum RevoraError {
     OracleQuoteStale = 91,
     /// A redemption request overlaps an existing pending redemption window.
     RedemptionWindowOverlap = 92,
+    /// The voter has zero voting weight in the pinned snapshot and cannot cast a vote.
+    NoVotingWeight = 94,
 }
 
 pub mod tax_bucket;
@@ -793,6 +795,7 @@ const EVENT_SNAP_FINALIZATION_CONFIG: Symbol = symbol_short!("snap_fnc");
 const EVENT_GOV_PROP_CREATED: Symbol = symbol_short!("gov_new");
 const EVENT_GOV_VOTE_CAST: Symbol = symbol_short!("gov_vote");
 const EVENT_WEIGHT_PIN: Symbol = symbol_short!("wt_pin");
+const EVENT_GOV_PROP_FINALIZED: Symbol = symbol_short!("gov_fin");
 /// Stable versioned indexed event for every ballot cast — consumed by off-chain indexers
 /// to reconstruct per-proposal governance state without re-reading all `gov_vote` events.
 /// Topic: `(ev_idx3, EventIndexTopicV3 { event_type: "vote_v3", period_id: 0, ... })`
@@ -1193,12 +1196,18 @@ pub struct GovProposalEntry {
     pub snapshot_id: u64,
     /// Ledger timestamp at proposal creation.
     pub created_at: u64,
+    /// Ledger timestamp when voting closes.
+    pub ends_at: u64,
+    /// Quorum required in basis points.
+    pub quorum_bps: u32,
     /// Accumulated yes-vote weight in basis points.
     pub yes_weight: u32,
     /// Accumulated no-vote weight in basis points.
     pub no_weight: u32,
     /// Whether the proposal is still accepting votes.
     pub open: bool,
+    /// Recorded outcome of the proposal (true if passed, false otherwise).
+    pub passed: bool,
 }
 
 /// Pending jurisdiction migration for a holder.
@@ -15029,12 +15038,38 @@ impl RevoraRevenueShare {
     /// - `OfferingNotFound` — offering does not exist.
     /// - `ContractFrozen` — contract is frozen.
     /// - `LimitReached` — no snapshot has been committed for this offering yet.
+    /// Create a new snapshot-pinned governance proposal for an offering.
+    ///
+    /// The proposal pins the latest committed snapshot at creation time; any shares
+    /// acquired after this call carry zero weight when voting.
+    ///
+    /// ### Auth
+    /// Requires `issuer.require_auth()`.
+    ///
+    /// ### Parameters
+    /// - `issuer`: Primary issuer of the offering.
+    /// - `namespace`: Offering namespace.
+    /// - `token`: Offering token.
+    /// - `description`: Human-readable proposal text (max 9 chars due to `Symbol` limit).
+    /// - `quorum_bps`: Required total vote weight in basis points (1..=10_000).
+    /// - `voting_window`: Duration of voting window in seconds (> 0).
+    ///
+    /// ### Returns
+    /// The new proposal id (`u32`).
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist.
+    /// - `ContractFrozen` — contract is frozen.
+    /// - `LimitReached` — no snapshot has been committed for this offering yet.
+    /// - `InvalidAmount` — quorum_bps is 0 or > 10_000, or voting_window is 0.
     pub fn create_gov_proposal(
         env: Env,
         issuer: Address,
         namespace: Symbol,
         token: Address,
         description: Symbol,
+        quorum_bps: u32,
+        voting_window: u64,
     ) -> Result<u32, RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
@@ -15047,6 +15082,13 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
         issuer.require_auth();
+
+        if quorum_bps == 0 || quorum_bps > 10_000 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        if voting_window == 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
 
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -15067,14 +15109,21 @@ impl RevoraRevenueShare {
         let proposal_id: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         let created_at = env.ledger().timestamp();
+        let ends_at = created_at
+            .checked_add(voting_window)
+            .ok_or(RevoraError::InvalidAmount)?;
+
         let proposal = GovProposalEntry {
             id: proposal_id,
             description: description.clone(),
             snapshot_id,
             created_at,
+            ends_at,
+            quorum_bps,
             yes_weight: 0,
             no_weight: 0,
             open: true,
+            passed: false,
         };
 
         env.storage()
@@ -15113,6 +15162,8 @@ impl RevoraRevenueShare {
     /// ### Errors
     /// - `OfferingNotFound` — offering does not exist.
     /// - `LimitReached` — proposal does not exist or is already closed.
+    /// - `ProposalExpired` — proposal voting window has elapsed.
+    /// - `NoVotingWeight` — voter has 0 weight in the pinned snapshot.
     /// - `ContractFrozen` — contract is frozen.
     /// - `AlreadyApproved` — voter has already voted on this proposal.
     pub fn cast_vote(
@@ -15148,6 +15199,11 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
+        // Voting window expiration guard.
+        if env.ledger().timestamp() >= proposal.ends_at {
+            return Err(RevoraError::ProposalExpired);
+        }
+
         // Idempotency / double-vote guard.
         let vote_key = DataKey3::VoteRecord(offering_id.clone(), proposal_id, voter.clone());
         if env.storage().persistent().has(&vote_key) {
@@ -15164,6 +15220,11 @@ impl RevoraRevenueShare {
                 voter.clone(),
             ))
             .unwrap_or(0);
+
+        // Reject zero-weight votes.
+        if weight == 0 {
+            return Err(RevoraError::NoVotingWeight);
+        }
 
         // Accumulate weight.
         if approve {
@@ -15245,7 +15306,65 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&DataKey3::GovProposalCount(offering_id)).unwrap_or(0)
     }
 
+    /// Finalize a governance proposal once voting deadline has passed.
+    ///
+    /// Determines whether the proposal passed based on yes >= no and total votes >= quorum_bps.
+    /// Callable by anyone after `ends_at`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist.
+    /// - `LimitReached` — proposal does not exist or is already finalized.
+    /// - `ClaimDelayNotElapsed` — voting deadline has not elapsed yet.
+    /// - `ContractFrozen` — contract is frozen.
+    pub fn finalize_gov_proposal(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        proposal_id: u32,
+    ) -> Result<bool, RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+
+        let _ = Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+            .ok_or(RevoraError::OfferingNotFound)?;
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let prop_key = DataKey3::GovProposal(offering_id, proposal_id);
+        let mut proposal: GovProposalEntry =
+            env.storage().persistent().get(&prop_key).ok_or(RevoraError::LimitReached)?;
+        if !proposal.open {
+            return Err(RevoraError::LimitReached);
+        }
+
+        if env.ledger().timestamp() < proposal.ends_at {
+            return Err(RevoraError::ClaimDelayNotElapsed);
+        }
+
+        let total_votes = proposal.yes_weight.saturating_add(proposal.no_weight);
+        let passed = proposal.yes_weight >= proposal.no_weight && total_votes >= proposal.quorum_bps;
+
+        proposal.open = false;
+        proposal.passed = passed;
+        env.storage().persistent().set(&prop_key, &proposal);
+
+        env.events().publish(
+            (EVENT_GOV_PROP_FINALIZED, issuer, namespace, token),
+            (proposal_id, passed, proposal.yes_weight, proposal.no_weight),
+        );
+
+        Ok(passed)
+    }
+
     /// Close a governance proposal so no further votes can be cast.
+    ///
+    /// Delegates to `finalize_gov_proposal` ensuring voting deadline has elapsed
+    /// and records final proposal outcome.
     ///
     /// ### Auth
     /// Requires `issuer.require_auth()`.
@@ -15253,6 +15372,7 @@ impl RevoraRevenueShare {
     /// ### Errors
     /// - `OfferingNotFound` — offering does not exist or caller is not the issuer.
     /// - `LimitReached` — proposal does not exist or is already closed.
+    /// - `ClaimDelayNotElapsed` — voting deadline has not elapsed yet.
     /// - `ContractFrozen` — contract is frozen.
     pub fn close_gov_proposal(
         env: Env,
@@ -15272,21 +15392,7 @@ impl RevoraRevenueShare {
         }
         issuer.require_auth();
 
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-
-        let prop_key = DataKey3::GovProposal(offering_id, proposal_id);
-        let mut proposal: GovProposalEntry =
-            env.storage().persistent().get(&prop_key).ok_or(RevoraError::LimitReached)?;
-        if !proposal.open {
-            return Err(RevoraError::LimitReached);
-        }
-        proposal.open = false;
-        env.storage().persistent().set(&prop_key, &proposal);
-        Ok(())
+        Self::finalize_gov_proposal(env, issuer, namespace, token, proposal_id).map(|_| ())
     }
 }
 
