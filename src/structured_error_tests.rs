@@ -125,6 +125,7 @@ mod tests {
             ("JurisdictionMigrationDeadlineExceeded", RevoraError::JurisdictionMigrationDeadlineExceeded as u32),
             ("TransferCooldownActive", RevoraError::TransferCooldownActive as u32),
             ("JurisdictionBlocked", RevoraError::JurisdictionBlocked as u32),
+            ("InvalidDisputeResolution", RevoraError::InvalidDisputeResolution as u32),
         ];
 
         // O(n²) uniqueness check — n is small, negligible cost.
